@@ -1,161 +1,217 @@
 # codevector products api
 
-## what we built
-a backend rest api that:
-- stores 200,000 products in postgresql
-- returns them newest first
-- filters by category
-- uses cursor-based pagination (stable and fast)
-- built with node.js, express, postgresql on neon, hosted on render
+## live urls
+- backend api: https://codevector-product-api.onrender.com
+- github repo: https://github.com/haripriyatripathi/codevector-product-api
 
----
+## what we did
+- built a backend rest api from scratch in one night with zero prior backend experience, learning node.js, express and postgresql on the go while understanding every line of code
+- implemented cursor-based pagination over offset pagination to ensure fast queries on 200,000 products and stable browsing even when new data is added, deployed live on render with neon postgresql database
 
-## tech stack
-| tool | purpose |
-|------|---------|
-| node.js | runtime environment |
-| express.js | web framework |
-| postgresql | database |
-| neon | cloud postgresql hosting (free) |
-| render | api hosting (free) |
-| faker.js | generate fake product data |
-| dotenv | load environment variables |
-| cors | allow frontend to call api |
-| pg | connect node.js to postgresql |
-
----
+## api endpoints
+| endpoint | description |
+|----------|-------------|
+| GET / | health check |
+| GET /products | get 20 products newest first |
+| GET /products?category=electronics | filter by category |
+| GET /products?cursor=XXX | get next page |
+| GET /products?limit=20 | set page size |
 
 ## project structure
 codevector-products-api/
 
 ├── src/
 
-│   ├── db.js        → database connection pool
+│   ├── db.js          → database connection pool
 
-│   ├── seed.js      → generates 200,000 products
+│   ├── seed.js        → generates 200,000 products in bulk
 
-│   └── index.js     → express server and api endpoints
+│   └── index.js       → express server and api endpoints
 
-├── .env             → secret credentials (not on github)
+├── frontend/          → bonus ui (next.js)
 
-├── .gitignore       → ignores node_modules and .env
+├── .env               → secret credentials (not on github)
 
-└── package.json     → project config and dependencies
----
+├── .gitignore         → ignores node_modules and .env
 
-## file by file explanation
+├── package.json       → project config and dependencies
 
-### db.js
-- creates a connection pool to postgresql
-- pool keeps connections open and reuses them
-- without pool: every request opens a new connection = slow
-- ssl enabled because neon requires encrypted connections
+└── README.md          → project documentation
 
-### seed.js
-- generates 200,000 fake products using faker.js
-- uses bulk insert — 1000 rows per query = 200 queries total
-- not 200,000 individual queries (would be very slow)
-- each product has: name, category, price, created_at, updated_at
-- 8 categories: electronics, clothing, books, furniture, sports, toys, beauty, food
-- random dates in last 2 years for created_at
+## packages used
+| package | version | purpose |
+|---------|---------|---------|
+| express | ^5.2.1 | web server framework |
+| pg | ^8.22.0 | connect node.js to postgresql |
+| dotenv | ^17.4.2 | load .env credentials |
+| cors | ^2.8.6 | allow frontend to call api |
+| @faker-js/faker | ^10.5.0 | generate fake product data |
 
-### index.js
-- express server on port 3000
-- cors enabled so frontend can call the api
-- two routes:
-  - GET / → health check
-  - GET /products → main endpoint with pagination and filtering
+## database schema
+```sql
+CREATE TABLE products (
+  id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+  name TEXT NOT NULL,
+  category TEXT NOT NULL,
+  price NUMERIC(10,2) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
 
----
+CREATE INDEX idx_products_cursor 
+ON products (created_at DESC, id DESC);
 
-## api endpoints
-
-### health check
-GET /
-```json
-{"status": "ok", "message": "products api running"}
+CREATE INDEX idx_products_category 
+ON products (category, created_at DESC, id DESC);
 ```
 
-### get products
-GET /products
+## how each file works
 
-GET /products?category=electronics
+### src/db.js
+- creates a postgresql connection pool
+- pool reuses connections instead of creating new one per request
+- ssl enabled because neon requires encrypted connections
+- exports pool so other files can use it
 
-GET /products?category=electronics&cursor=XXXXX
+### src/seed.js
+- generates 200,000 fake products using faker.js
+- uses bulk insert — 1000 rows per query
+- total of 200 queries instead of 200,000
+- 8 categories: electronics, clothing, books, furniture, sports, toys, beauty, food
+- random prices between $10 and $10,000
+- random dates within last 2 years
 
+### src/index.js
+- express server running on port 3000
+- cors enabled for frontend access
+- GET / → health check endpoint
+- GET /products → main endpoint with:
+  - cursor-based pagination
+  - category filtering
+  - base64 encoded cursor
+  - returns data and nextCursor and hasMore
+
+## how cursor pagination works
+
+### first page request
 GET /products?limit=20
 ```json
 {
   "data": [...20 products],
-  "nextCursor": "base64encodedcursor",
+  "nextCursor": "MjAyNC0wMS0xNVQxMDozMDowMFpfX191dWlkLWhlcmU=",
   "hasMore": true
 }
 ```
 
----
-
-## the key concept — cursor vs offset pagination
-
-### offset pagination (wrong approach)
-```sql
-SELECT * FROM products LIMIT 20 OFFSET 100
+### next page request
+GET /products?cursor=MjAyNC0wMS0xNVQxMDozMDowMFpfX191dWlkLWhlcmU=
+```json
+{
+  "data": [...next 20 products],
+  "nextCursor": "NEXT_CURSOR",
+  "hasMore": true
+}
 ```
-problem 1 — slow: database scans 100 rows just to skip them. gets slower on large tables.
-problem 2 — unstable: if 50 new products added while browsing page 3, offset shifts. you see duplicates or miss products.
 
-### cursor pagination (correct approach)
-```sql
-WHERE (created_at, id) < (:last_timestamp, :last_id)
-ORDER BY created_at DESC, id DESC
-LIMIT 20
+### last page
+```json
+{
+  "data": [...last products],
+  "nextCursor": null,
+  "hasMore": false
+}
 ```
-why fast: uses index directly. jumps straight to right row — no scanning.
-why stable: says "give me products older than this timestamp+id". new products at top don't affect your position.
-why id as tiebreaker: multiple products can have same created_at. id makes ordering 100% unique.
 
----
-
-## how cursor encoding works
+## cursor encoding
 ```js
-// encoding — when sending response
+// encoding — last item becomes next cursor
 const nextCursor = Buffer.from(
   `${last.created_at.toISOString()}___${last.id}`
 ).toString('base64');
 
-// decoding — when receiving request
+// decoding — cursor decoded to get timestamp and id
 const [cursorTime, cursorId] = Buffer.from(cursor, 'base64')
   .toString()
   .split('___');
 ```
-why base64: makes cursor url-safe. hides implementation details from client.
-why ___ separator: three underscores won't appear in uuid or timestamp so splitting is safe.
 
----
+## sql queries used
 
+### no cursor, no category (first page)
+```sql
+SELECT id, name, category, price, created_at, updated_at
+FROM products
+ORDER BY created_at DESC, id DESC
+LIMIT 20
+```
 
-## architecture flow
-client request
+### with cursor, no category
+```sql
+SELECT id, name, category, price, created_at, updated_at
+FROM products
+WHERE (created_at, id) < ($1::timestamptz, $2::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT 20
+```
 
-↓
+### with cursor and category
+```sql
+SELECT id, name, category, price, created_at, updated_at
+FROM products
+WHERE category = $1
+  AND (created_at, id) < ($2::timestamptz, $3::uuid)
+ORDER BY created_at DESC, id DESC
+LIMIT 20
+```
 
-express server (render)
+## why cursor over offset pagination
+| offset pagination | cursor pagination |
+|------------------|------------------|
+| slow on large tables | fast — uses index directly |
+| breaks when data changes | stable — bookmark based |
+| 200k rows = slow scan | jumps to exact position |
+| duplicates possible | no duplicates ever |
 
-↓
+## hosting
+| service | platform | url |
+|---------|----------|-----|
+| backend api | render (free) | https://codevector-product-api.onrender.com |
+| database | neon (free) | postgresql on aws us-east-1 |
+| frontend ui | v0.dev | bonus only |
 
-parse cursor + category from query params
+## what i would improve with more time
+- input validation with proper 400 errors
+- cursor validation
+- rate limiting (100 req/min per ip)
+- morgan for request logging
+- redis caching for first page
+- post /products endpoint to add new products
+- typescript for better type safety
+- unit tests for pagination logic
 
-↓
+## categories available
+electronics | clothing | books | furniture | sports | toys | beauty | food
 
-build sql with cursor where clause
+## how to run locally
+```bash
+# clone repo
+git clone https://github.com/haripriyatripathi/codevector-product-api.git
+cd codevector-product-api
 
-↓
+# install dependencies
+npm install
 
-postgresql on neon (indexed lookup)
+# create .env file
+DATABASE_URL=your_neon_connection_string
+PORT=3000
 
-↓
+# seed 200,000 products
+node src/seed.js
 
-return 20 products and nextcursor token
+# start server
+npm start
 
-↓
+# test
+curl http://localhost:3000/products
+```
 
-client uses nextcursor for next page
